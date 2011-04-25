@@ -1,0 +1,784 @@
+#!/usr/bin/perl
+
+# dbmail-postfix-policyd: a Postfix policy server for DBmail
+# Copyright 2005,2011 (c) Jesse Norell
+# Copyright 2005,2011 (c) Kentec Communications, Inc.
+
+# adapted from postgrey, Copyright 2004 (c) ETH Zurich
+# released under the GNU General Public License
+
+# see the documentation with 'perldoc dbmail-postfix-policyd'
+
+package dbmail_postfix_policyd;
+use strict;
+use Pod::Usage;
+use Getopt::Long 2.25 qw(:config posix_default no_ignore_case);
+use Net::Server::Multiplex;
+use Config::IniFiles;
+use Sys::Hostname;
+use DBI;
+
+use vars qw(@ISA);
+@ISA = qw(Net::Server::Multiplex);
+
+my $VERSION = "0.01";
+my $hostname = hostname;
+my $quota_recurse_depth = 0;
+
+sub read_dbmail_conf($$)
+{
+    my ($self, $fatal) = @_;
+    my %ini;
+
+    if ((! defined $self->{dbmail_postfix_policyd}{dbmail_conf}) or
+        (! -r $self->{dbmail_postfix_policyd}{dbmail_conf})        ) {
+      return $fatal;
+    }
+
+    $self->log(4, "tieing config file: ".$self->{dbmail_postfix_policyd}{dbmail_conf});
+    tie %ini, 'Config::IniFiles', ( -file => $self->{dbmail_postfix_policyd}{dbmail_conf} )
+      or $fatal and die "ERROR: $self->{dbmail_postfix_policyd}{dbmail_conf}: $!\n";
+
+    if (defined $ini{DBMAIL}{driver}) {
+      $self->log(4, "read {DBMAIL}{driver}: $ini{DBMAIL}{driver}");
+      $self->{dbmail_postfix_policyd}{dbdriver} = $ini{DBMAIL}{driver};
+    }
+    if (defined $ini{DBMAIL}{host}) {
+      $self->log(4, "read {DBMAIL}{host}: $ini{DBMAIL}{host}");
+      $self->{dbmail_postfix_policyd}{dbhost} = $ini{DBMAIL}{host};
+    }
+    if (defined $ini{DBMAIL}{sqlport}) {
+      $self->log(4, "read {DBMAIL}{sqlport}: $ini{DBMAIL}{sqlport}");
+      $self->{dbmail_postfix_policyd}{dbsqlport} = $ini{DBMAIL}{sqlport};
+    }
+    if (defined $ini{DBMAIL}{sqlsocket}) {
+      $self->log(4, "read {DBMAIL}{sqlsocket}: $ini{DBMAIL}{sqlsocket}");
+      $self->{dbmail_postfix_policyd}{dbsqlsocket} = $ini{DBMAIL}{sqlsocket};
+    }
+    if (defined $ini{DBMAIL}{user}) {
+      $self->log(4, "read {DBMAIL}{user}: $ini{DBMAIL}{user}");
+      $self->{dbmail_postfix_policyd}{dbuser} = $ini{DBMAIL}{user};
+    }
+    if (defined $ini{DBMAIL}{pass}) {
+      $self->log(4, "read {DBMAIL}{pass}: $ini{DBMAIL}{pass}");
+      $self->{dbmail_postfix_policyd}{dbpass} = $ini{DBMAIL}{pass};
+    }
+    if (defined $ini{DBMAIL}{db}) {
+      $self->log(4, "read {DBMAIL}{db}: $ini{DBMAIL}{db}");
+      $self->{dbmail_postfix_policyd}{dbdb} = $ini{DBMAIL}{db};
+    }
+    if (defined $ini{DBMAIL}{table_prefix}) {
+      $self->log(4, "read {DBMAIL}{table_prefix}: $ini{DBMAIL}{table_prefix}");
+      $self->{dbmail_postfix_policyd}{table_prefix} = $ini{DBMAIL}{table_prefix};
+    }
+
+    return 0;
+}
+
+# main routine: based on attributes specified as argument, return policy decision
+sub smtpd_access_policy($$)
+{
+    my ($self, $attr) = @_;
+
+    # Quota Check requires these:
+    defined $attr->{recipient} or return 'DUNNO';
+    defined $attr->{size} or return 'DUNNO';
+
+    my $recipient = lc($attr->{recipient});
+    my $size = $attr->{size};
+
+    # Quota Check
+    dbmail_quota_check($self, $recipient, $size) && 
+    	return "552 Message too large, recipient $recipient would exceed size limits at this time.";
+
+    return 'DUNNO';
+}
+
+# Quota Check
+# We recursively expand aliases, so a single recipient can check against multiple quotas.
+# If any of them is under quota, we must allow the message (return 0).
+# If any recipients are forwarded externally or execute a command, allow the message.
+# Return true (1) only if all recipients would exceed quota.
+sub dbmail_quota_check($$)
+{
+    my ($self, $recipient, $size) = @_;
+
+    unless ($recipient) { return 0; }
+    unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
+
+    $quota_recurse_depth = 0;
+
+    # The v1 and v2 checks have a lot of overlap, but the logic is cleaner if kept separate
+    if ($self->{dbmail_postfix_policyd}{dbmail_version} == 1) {
+	return dbmail_v1_quota_check($self, $recipient, $size);
+    } elsif ($self->{dbmail_postfix_policyd}{dbmail_version} == 2) {
+	return dbmail_v2_quota_check($self, $recipient, $size);
+    }
+
+    return 0;
+}
+
+# Quota Check for DBMail version 1.2 schema
+# Return true (1) only if all recipients would exceed quota.
+# (see comments at top of dbmail_quota_check())
+sub dbmail_v1_quota_check($$)
+{
+    my ($self, $recipient, $size) = @_;
+    my $dbh = $self->{dbmail_postfix_policyd}{dbh};
+    my $alias_sth = $self->{dbmail_postfix_policyd}{alias_sth};
+    my $quota_sth = $self->{dbmail_postfix_policyd}{quota_sth};
+    my $quota_by_userid_sth = $self->{dbmail_postfix_policyd}{quota_by_userid_sth};
+    my ($query, @row, $numrows, $max, $cur);
+    my ($deliver_to, @user_idnrs, @recurse);
+
+    my $t_aliases = "$self->{dbmail_postfix_policyd}{table_prefix}aliases";
+    my $t_users = "$self->{dbmail_postfix_policyd}{table_prefix}users";
+    my $t_mailboxes = "$self->{dbmail_postfix_policyd}{table_prefix}mailboxes";
+    my $t_messages = "$self->{dbmail_postfix_policyd}{table_prefix}messages";
+
+    unless ($recipient = lc($recipient)) { return 0; }
+    unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
+
+    # what's a sane max depth here?
+    if ($quota_recurse_depth++ > 12) {
+	$self->log(2, "recipient $recipient hit max quota_recurse_depth - possible alias loop");
+	return 0;
+    }
+
+    unless ($alias_sth) {
+	$query = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
+	$alias_sth = $dbh->prepare($query);
+	$self->{dbmail_postfix_policyd}{alias_sth} = $alias_sth;
+    }
+    $alias_sth->execute($recipient);
+    for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
+	$deliver_to = $row[0];
+
+	# commands start with ! or |
+	($deliver_to =~ /^(\!|\|)$/) && return 0;
+
+	# all-numeric is a userid
+	if ($deliver_to =~ /^(\d+)$/) {
+	   push @user_idnrs, $deliver_to;
+	} else {
+	   push @recurse, $deliver_to;
+	}
+    }
+
+    # recursive lookups of mail forwards
+    foreach my $recip (@recurse) {
+	dbmail_v1_quota_check($self, $recip, $size) || return 0;
+    }
+
+    # at this point, dbmail 1.2 should have all user_idnr's in @user_idnrs,
+    # we won't recurse past this point.
+    $quota_recurse_depth--;
+
+    # didn't find a matching alias:  a showstopper for dbmail 1.x
+    if ($numrows == 0) {
+	return 0;
+    }
+
+    # at this point, all user's ids are in @user_idnrs,
+    # we can definitively check their quota
+    foreach my $user_idnr (@user_idnrs) {
+	unless ($quota_sth) {
+	    $query = "SELECT maxmail_size, SUM(messagesize) AS curmail_size "
+		. "FROM $t_users, mailboxes "
+		. "join messages on ${t_messages}.mailbox_idnr = ${t_mailboxes}.mailbox_idnr "
+		. "where user_idnr = ? "
+        	. "and owner_idnr = user_idnr "
+        	. "and status < 2 "
+		. "group by user_idnr, maxmail_size ";
+	    $quota_sth = $dbh->prepare($query);
+	    $self->{dbmail_postfix_policyd}{quota_sth} = $quota_sth;
+	}
+	$quota_sth->execute($user_idnr);
+
+	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
+	    ($max == 0) && return 0;
+	    ($cur + $size <= $max) && return 0;
+	}
+	($numrows) || return 0;
+    }
+
+    $self->log(4, "$recipient: $size bytes would exceed quota");
+    return 1;
+}
+
+# Quota Check for DBMail version 2.x schema
+# Return true (1) only if all recipients would exceed quota.
+# (see comments at top of dbmail_quota_check())
+sub dbmail_v2_quota_check($$)
+{
+    my ($self, $recipient, $size) = @_;
+    my $dbh = $self->{dbmail_postfix_policyd}{dbh};
+    my $alias_sth = $self->{dbmail_postfix_policyd}{alias_sth};
+    my $quota_sth = $self->{dbmail_postfix_policyd}{quota_sth};
+    my $quota_by_userid_sth = $self->{dbmail_postfix_policyd}{quota_by_userid_sth};
+    my ($query, @row, $numrows, $max, $cur);
+    my ($deliver_to, @user_idnrs, @recurse);
+
+    my $t_aliases = "$self->{dbmail_postfix_policyd}{table_prefix}aliases";
+    my $t_users = "$self->{dbmail_postfix_policyd}{table_prefix}users";
+    my $t_mailboxes = "$self->{dbmail_postfix_policyd}{table_prefix}mailboxes";
+    my $t_messages = "$self->{dbmail_postfix_policyd}{table_prefix}messages";
+
+    unless ($recipient = lc($recipient)) { return 0; }
+    unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
+
+    # what's a sane max depth here?
+    if ($quota_recurse_depth++ > 12) {
+	$self->log(2, "recipient $recipient hit max quota_recurse_depth - possible alias loop");
+	return 0;
+    }
+
+    unless ($alias_sth) {
+	$query = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
+	$alias_sth = $dbh->prepare($query);
+	$self->{dbmail_postfix_policyd}{alias_sth} = $alias_sth;
+    }
+    $alias_sth->execute($recipient);
+    for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
+	$deliver_to = $row[0];
+
+	# commands start with ! or |
+	($deliver_to =~ /^(\!|\|)$/) && return 0;
+
+	# all-numeric is a userid
+	if ($deliver_to =~ /^(\d+)$/) {
+	   push @user_idnrs, $deliver_to;
+	} else {
+	   push @recurse, $deliver_to;
+	}
+    }
+
+    # recursive lookups of mail forwards
+    foreach my $recip (@recurse) {
+	dbmail_v2_quota_check($self, $recip, $size) || return 0;
+    }
+
+    # at this point, dbmail 2.x may have all user_idnr's in @user_idnrs,
+    # or we may need to just do a userid lookup for the recipient.
+    # either way, we won't recurse past this point.
+    $quota_recurse_depth--;
+
+    # TODO:  need to add user@ and @domain catchall lookups
+
+    if ($numrows == 0) {
+	unless ($quota_by_userid_sth) {
+	    $query = "SELECT maxmail_size, curmail_size from $t_users "
+		. " where lower(userid) = ?";
+	    $quota_by_userid_sth = $dbh->prepare($query);
+	    $self->{dbmail_postfix_policyd}{quota_by_userid_sth} = $quota_by_userid_sth;
+	}
+	$quota_by_userid_sth->execute($recipient);
+
+	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ) {
+	    ($max == 0) && return 0;
+	    ($cur + $size <= $max) && return 0;
+	}
+	# dbmail 2. must have processed a row now, or will yet process @user_idnrs
+	($numrows && ($#user_idnrs >= 0)) || return 0;
+    }
+
+    # at this point, all user's ids are in @user_idnrs,
+    # we can definitively check their quota
+    foreach my $user_idnr (@user_idnrs) {
+	unless ($quota_sth) {
+	    $query = "SELECT maxmail_size, curmail_size from $t_users "
+		. " where user_idnr = ?";
+	    $quota_sth = $dbh->prepare($query);
+	    $self->{dbmail_postfix_policyd}{quota_sth} = $quota_sth;
+	}
+	$quota_sth->execute($user_idnr);
+
+	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
+	    ($max == 0) && return 0;
+	    ($cur + $size <= $max) && return 0;
+	}
+	($numrows) || return 0;
+    }
+
+    $self->log(4, "$recipient: $size bytes would exceed quota");
+    return 1;
+}
+
+sub main()
+{
+    # save arguments for Net:Server HUP restart
+    my @ARGV_saved = @ARGV;
+
+    # do not output any localized texts!
+    $ENV{LC_ALL}='C';
+
+    # parse options
+    my %opt = ();
+    GetOptions(\%opt, 'help|h', 'man', 'version', 'noaction|no-action|n',
+        'verbose|v', 'daemonize|d', 'unix|u=s', 'inet|i=s', 'user=s',
+        'group=s', 'pidfile=s', 'dbtype=s', 'dbhost=s', 'dbsqlport=s',
+        'dbsqlsocket=s', 'dbuser=s', 'dbpass=s', 'dbdb=s',
+        'dbmail-conf|f=s', 'dbmail-version|V=s', 'table_prefix=s',
+    ) or exit(1);
+
+    if($opt{help})     { pod2usage(1) }
+    if($opt{man})      { pod2usage(-exitstatus => 0, -verbose => 2) }
+    if($opt{version})  { print "dbmail-postfix-policyd $VERSION\n"; exit(0) }
+    if($opt{noaction}) { die "ERROR: don't know how to \"no-action\".\n" }
+
+    defined $opt{unix} or defined $opt{inet} or
+        die "ERROR: --unix or --inet must be specified\n";
+
+    # bind only localhost if no host is specified
+    if(defined $opt{inet} and $opt{inet}=~/^\d+$/) {
+        $opt{inet} = "localhost:$opt{inet}";
+    }
+
+    defined $opt{dbtype} and $opt{dbtype} !~ m/^((my|pg)sql|sqlite)$/i and
+        die "ERROR: unsupported dbtype (use mysql, pgsql, or sqlite)\n";
+
+    # note: more option checks are done in post_configure_hook(),
+    # so we can use logging
+
+    # create Net::Server object and run it
+    my $server = bless {
+        server => {
+            commandline      => [ $0, @ARGV_saved ],
+            opt              => { %opt },
+            port             => [ $opt{inet} ? $opt{inet} : $opt{unix}."|unix" ],
+            proto            => $opt{inet} ? 'tcp' : 'unix',
+            user             => $opt{user} || 'dbmail',
+            group            => $opt{group} || 'dbmail',
+            setsid           => $opt{daemonize} ? 1 : undef,
+            pid_file         => $opt{daemonize} ? $opt{pidfile} : undef,
+            log_level        => $opt{verbose} ? 4 : 2,
+            log_file         => $opt{daemonize} ? 'Sys::Syslog' : undef,
+            syslog_logsock   => $^O eq 'solaris' ? 'inet' : 'unix',
+            syslog_facility  => 'mail',
+            syslog_ident     => 'dbmail-postfix-policyd',
+		# need to hold the database connection (and a lock, if needed) here
+        },
+        dbmail_postfix_policyd => {
+            dbmail_conf      => $opt{'dbmail-conf'} ? $opt{'dbmail-conf'} : '/etc/dbmail/dbmail.conf',
+            dbmail_version   => $opt{'dbmail-version'} ? $opt{'dbmail-version'} : 2,
+            dbtype           => $opt{dbtype} ? $opt{dbtype} : undef,
+            dbhost           => $opt{dbhost} ? $opt{dbhost} : undef,
+            dbsqlport        => $opt{dbsqlport} ? $opt{dbsqlport} : undef,
+            dbsqlsocket      => $opt{dbsqlsocket} ? $opt{dbsqlsocket} : undef,
+            dbuser           => $opt{dbuser} ? $opt{dbuser} : undef,
+            dbpass           => $opt{dbpass} ? $opt{dbpass} : undef,
+            dbdb             => $opt{dbdb} ? $opt{dbdb} : undef,
+            table_prefix     => $opt{table_prefix} ? $opt{table_prefix} : undef,
+        },
+    }, 'dbmail_postfix_policyd';
+
+    if (defined $opt{'dbmail-conf'}) {
+      $server->read_dbmail_conf(1) and 
+        die "ERROR: error reading $server->{dbmail_postfix_policyd}{dbmail_conf}\n";
+    }
+    elsif (defined $opt{dbhost} and defined $opt{dbuser}
+        and defined $opt{dbpass} and defined $opt{dbdb}) {
+      $server->read_dbmail_conf(0);
+      $server->{dbmail_postfix_policyd}{dbmail_conf} = undef;
+    }
+    else {
+      $server->read_dbmail_conf(1) and
+         die "ERROR: error reading $server->{dbmail_postfix_policyd}{dbmail_conf}\n";
+    }
+
+    unless (defined $server->{dbmail_postfix_policyd}{dbtype}) {
+	if (defined $server->{dbmail_postfix_policyd}{dbdriver}) {
+	    $_ = $server->{dbmail_postfix_policyd}{dbdriver};
+	    if ((/^postgresql$/) or (/^pgsql$/)) {
+	 	$server->{dbmail_postfix_policyd}{dbtype} = 'pgsql';
+	    }
+	    if ((/^mysql$/) or (/^sqlite$/)) {
+	 	$server->{dbmail_postfix_policyd}{dbtype} = $server->{dbmail_postfix_policyd}{dbdriver};
+	    }
+	} else {
+            die "ERROR: dbtype required (mysql or pgsql)\n";
+	}
+    }
+    if (defined $opt{dbhost}) {
+      $server->{dbmail_postfix_policyd}{dbhost} = $opt{dbhost};
+    }
+    if (defined $opt{dbsqlport}) {
+      $server->{dbmail_postfix_policyd}{dbsqlport} = $opt{dbsqlport};
+    }
+    if (defined $opt{dbsqlsocket}) {
+      $server->{dbmail_postfix_policyd}{dbsqlsocket} = $opt{dbsqlsocket};
+    }
+    if (defined $opt{dbuser}) {
+      $server->{dbmail_postfix_policyd}{dbuser} = $opt{dbuser};
+    }
+    if (defined $opt{dbpass}) {
+      $server->{dbmail_postfix_policyd}{dbpass} = $opt{dbpass};
+    }
+    if (defined $opt{dbdb}) {
+      $server->{dbmail_postfix_policyd}{dbdb} = $opt{dbdb};
+    }
+
+    # TODO: need to handle dbmail_version 3 and check for libzdb settings
+    unless (( $server->{dbmail_postfix_policyd}{dbmail_version} == 2
+             and
+             ( defined $server->{dbmail_postfix_policyd}{dbsqlsocket}
+               or
+               ( defined $server->{dbmail_postfix_policyd}{dbhost}
+                 and
+                 defined $server->{dbmail_postfix_policyd}{dbsqlport}
+               )
+             )
+             and
+             ( defined $server->{dbmail_postfix_policyd}{dbuser}
+               and
+               defined $server->{dbmail_postfix_policyd}{dbpass}
+               and
+               defined $server->{dbmail_postfix_policyd}{dbdb}
+             )
+            )
+          or 
+            ( $server->{dbmail_postfix_policyd}{dbmail_version} == 1
+             and
+             ( defined $server->{dbmail_postfix_policyd}{dbhost}
+              and
+              defined $server->{dbmail_postfix_policyd}{dbuser}
+              and
+              defined $server->{dbmail_postfix_policyd}{dbpass}
+              and
+              defined $server->{dbmail_postfix_policyd}{dbdb}
+             )
+            )
+          )
+    {
+      die "ERROR:  You must either provide a dbmail.conf \n"
+        . "or specify all db parameters on the command line.\n";
+    }
+
+    if (defined $opt{table_prefix}) {
+      $server->{dbmail_postfix_policyd}{table_prefix} = $opt{table_prefix};
+    }
+    else {
+      if ($server->{dbmail_postfix_policyd}{dbmail_version} > 1) {
+        $server->{dbmail_postfix_policyd}{table_prefix} = 'dbmail_';
+      }
+      else {
+        $server->{dbmail_postfix_policyd}{table_prefix} = '';
+      }
+    }
+
+    $server->run;
+}
+
+
+
+##### Net::Server::Multiplex methods:
+
+# reload dbmail.conf on HUP, completely untested, may be incomplete or broken
+#sub sig_hup {
+#    my $self = shift;
+#    $self->{net_server}->log(2, "HUP received: reloading dbmail.conf...");
+#    $self->read_dbmail_conf();
+#	# this in particular may be wrong:
+#    if (defined &{$self->{dbmail_postfix_policyd}{dbh}->disconnect}) {
+#    	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
+#    }
+#    $self->{dbmail_postfix_policyd}{dbh} = {};
+#    pre_loop_hook($self)
+#}
+
+sub pre_loop_hook()
+{
+    my ($self) = @_;
+    my ($dbd_type, $data_source);
+
+    # write files with mode 600
+    umask 0077;
+
+    # unix socket permissions should be 666
+    if($self->{server}{proto} eq 'unix') {
+        my $unix_path = $self->{server}{port}[0];
+        $unix_path =~ s/\|unix$//;
+        chmod 0666, $unix_path;
+    }
+
+    # be sure to put in syslog any warnings / fatal errors
+    if($self->{server}{log_file} eq 'Sys::Syslog') {
+        $SIG{__WARN__} = sub { Sys::Syslog::syslog('warning', "warning: $_[0]") };
+        $SIG{__DIE__}  = sub { Sys::Syslog::syslog('crit', "fatal: $_[0]"); die @_; };
+    }
+
+    # open database connection and save the handle in $self->{server}
+    if ($self->{dbmail_postfix_policyd}{dbtype} =~ m/^pgsql$/i) {
+      $dbd_type='Pg';
+    } elsif ($self->{dbmail_postfix_policyd}{dbtype} =~ m/^mysql$/i) {
+      $dbd_type='mysql';
+    } elsif ($self->{dbmail_postfix_policyd}{dbtype} =~ m/^sqlite$/i) {
+      $dbd_type='SQLite';
+    } else {
+      die "pre_loop_hook: unknown dbtype: this should not have happened!\n";
+    }
+    $data_source="dbi:$dbd_type:dbname=$self->{dbmail_postfix_policyd}{dbdb}";
+
+    if (defined $self->{dbmail_postfix_policyd}{dbhost}) {
+	$data_source .= ";host=$self->{dbmail_postfix_policyd}{dbhost}";
+	if (defined $self->{dbmail_postfix_policyd}{dbsqlport}) {
+	    $data_source .= ";port=$self->{dbmail_postfix_policyd}{dbsqlport}";
+	}
+    } elsif (defined $self->{dbmail_postfix_policyd}{dbsqlsocket}) {
+	$data_source .= ";host=$self->{dbmail_postfix_policyd}{dbsqlsocket}";
+    }
+
+    $self->{dbmail_postfix_policyd}{dbh} = DBI->connect($data_source,
+      $self->{dbmail_postfix_policyd}{dbuser},
+      $self->{dbmail_postfix_policyd}{dbpass},
+      { RaiseError => 1, AutoCommit => 1 } ) || die "Error connecting to database: $DBI::errstr\n";
+}
+
+sub mux_input()
+{
+    my ($self, $mux, $fh, $in_ref) = @_;
+    defined $self->{dbmail_postfix_policyd} or $self->{dbmail_postfix_policyd} = {};
+    my $attr = $self->{dbmail_postfix_policyd};
+
+    # consume entire lines
+    while ($$in_ref =~ s/^([^\r\n]*)\r?\n//) {
+        next unless defined $1;
+        my $in = $1;
+        if($in =~ /([^=]+)=(.*)/) {
+            # read attributes
+            $attr->{substr($1, 0, 512)} = substr($2, 0, 512);
+        }
+        elsif($in eq '') {
+            defined $attr->{request} or $attr->{request}='';
+            if($attr->{request} ne 'smtpd_access_policy') {
+                $self->{net_server}->log(2, "unrecognized request type: '$attr->{request}'");
+            }
+            else {
+                # decide
+                my $action = $self->{net_server}->smtpd_access_policy($attr);
+                # debug
+                if($self->{net_server}{server}{log_level}>=4) {
+                    my $a = 'request: ';
+                    $a .= join(' ', map {"$_=$attr->{$_}"} (sort keys %$attr));
+                    $a .= " action=$action";
+                    $self->{net_server}->log(4, $a);
+                }
+                # give answer
+                print $fh "action=$action\n\n";
+            }
+            $self->{dbmail_postfix_policyd} = {};
+        }
+        else {
+             $self->{net_server}->log(2, "ignoring garbage: <".substr($in, 0, 100).">");
+        }
+    }
+}
+
+main;
+
+__END__
+
+=head1 NAME
+
+dbmail-postfix-policyd - Postfix Policy Server for DBmail
+
+=head1 SYNOPSIS
+
+B<dbmail-postfix-policyd> [I<options>...]
+
+ -h, --help              display this help and exit
+     --version           output version information and exit
+ -v, --verbose           increase verbosity level
+
+ -u, --unix=PATH         listen on unix socket PATH
+ -i, --inet=[HOST:]PORT  listen on PORT, localhost if HOST is not specified
+ -d, --daemonize         run in the background
+     --pidfile=PATH      put daemon pid into this file
+     --user=USER         run as USER (default: dbmail)
+     --group=GROUP       run as group GROUP (default: dbmail)
+
+ -f, --dbmail-conf=PATH     location of dbmail.conf file
+                            (default: /etc/dbmail/dbmail.conf)
+ -V, --dbmail-version=VER   dbmail version in use (default: 2)
+     --table_prefix=PREFIX  dbmail table prefix
+                            (default:    ''     for dbmail-version = 1
+                                      'dbmail_' for dbmail-version > 1 )
+
+     --dbtype=TYPE       database type, mysql, pgsql, or sqlite (default: read from dbmail.conf)
+     --dbhost=HOST       database host (default: read from dbmail.conf)
+     --sqlport=PORT      database port (default: read from dbmail.conf)
+     --sqlsocket=PATH    database socket (default: read from dbmail.conf)
+     --dbuser=USER       database username (default: read from dbmail.conf)
+     --dbpass=PASS       database password (default: read from dbmail.conf)
+     --dbdb=DB           database name (default: read from dbmail.conf)
+
+  Note the database parameters are read from dbmail.conf and can be
+  overwritten with command-line options.  dbmail.conf is not needed
+  if you supply all options on the command-line, but don't do that
+  for security reasons if you have other users on your machine.
+
+=head1 DESCRIPTION
+
+dbmail-postfix-policyd is a Postfix policy server for use with DBmail.
+Currenly only a Quota Check is performed, though other dbmail-specific
+checks could be added in the future.
+
+=head2 Quota Check
+
+=over 4
+
+When a request for delivery of a mail is received by Postfix via SMTP,
+recipient address is first checked for existance in dbmail's aliases and/or
+users table (varies by dbmail version), and matching aliases expanded.  If
+all possible delivery recipients would go over quota by receiving the message,
+it is rejected.  (Typically there is only one delivery recipient, going to
+the user's INBOX.)  This helps keep your local mail queue clear of many of the
+undeliverable over-quota bounces dbmail generates.
+
+=back
+
+=head1 INSTALLATION
+
+=over 4
+
+=item *
+
+Create a C<dbmail> user and /etc/dbmail/dbmail.conf config file
+(both probably exist, if you're already running dbmail).
+
+=item *
+
+Write an init script to start dbmail-postfix-policyd at boot and start it.
+Like this for example:
+
+ dbmail-postfix-policyd --inet=60001 -d
+
+or:
+
+ dbmail-postfix-policyd --inet=60001 -d -f=/etc/dbmail.conf -V=1 --dbtype=mysql
+
+=item *
+
+Configure postfix to use the policy service with something like this in
+/etc/postfix/main.cf:
+
+ smtpd_recipient_restrictions =
+               ...
+               reject_unauth_destination
+               check_policy_service inet:127.0.0.1:60001
+
+ smtpd_end_of_data_restrictions =
+               check_policy_service inet:127.0.0.1:60001
+
+If your postfix setup uses an after-queue content filter
+(eg. for spam or virus scanning), add a
+C<-o smtpd_end_of_data_restrictions =>
+to the after-filter smtp server.
+
+=back
+
+=head1 SEE ALSO
+
+See L<http://www.dbmail.org/> for more information on
+dbmail.
+
+See L<http://www.postfix.org/SMTPD_POLICY_README.html>
+for a description of how Postfix policy servers work,
+and L<http://www.postfix.org/FILTER_README.html> for
+information on setting up Postfix after-queue content
+fiters.
+
+=head1 TODO 
+
+=over 4
+
+=item -
+Need to add user@ and @domain catchall lookups.
+
+=item -
+Improve logging (content and destination).
+
+=item -
+Handle errors/restarts, maybe create a watcher script or 
+test performance running as a service right from master.cf.
+
+=item -
+Choose/add a default port number.
+
+=item -
+Capability to prompt for database password.
+
+=item -
+Stress-test everything, watch for query performance, etc.
+
+=item -
+SQLite/Oracle/Other Support
+
+=item -
+Sieve Support (per-folder quotas, forwarding, etc.) ?
+
+=item -
+Add option to customize returned message.
+
+=item -
+Scrap everything and re-write a policy server based on dbmail-lmtpd ?
+
+=back
+
+=head1 COPYRIGHT
+
+=over 4
+
+=item
+Copyright (c) 2005,2011 by Jesse Norell.  All rights reserved.
+
+=item
+Copyright (c) 2005,2011 by Kentec Communications,  Inc.  All rights reserved.
+
+=item
+Portions Copyright (c) 2004-2007 by ETH Zurich. All rights reserved.
+
+=back
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+=head1 AUTHOR
+
+=over 4
+
+=item
+Initial DBMail quota support: S<Jesse Norell E<lt>jesse@kci.netE<gt>>
+
+=item
+Code based on postgrey, Copyright 2004 (c) ETH Zurich.
+
+=back
+
+=head1 HISTORY
+
+=over 4
+
+=item -
+2011-04-08 jn Completed initial version
+
+=item -
+2005-02-14 jn Initial work begun
+
+=back
+
+=cut
+

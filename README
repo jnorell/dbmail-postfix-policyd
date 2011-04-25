@@ -1,0 +1,17 @@
+dbmail-postfix-policyd is a Postfix policy server for use with DBmail.
+
+	Copyright (c) 2005,2011 by Jesse Norell.  All rights reserved.
+	Copyright (c) 2005,2011 by Kentec Communications,  Inc.  All rights reserved.
+
+	dbmail-postfix-policyd was started as a fork of sqlgrey
+	(carrying over the GNU General Public License), and as such:
+
+	Portions Copyright (c) 2004-2007 by ETH Zurich. All rights reserved.
+
+
+Currently only a Quota Check is performed, allowing some mail to be
+rejected in SMTP that would otherwise push a user over their quota limits
+(rather than accepting the mail in SMTP and generating a bounce message).
+That keeps undeliverable bounce messages out of your local mail queue,
+and is better net etiquitte.
+
