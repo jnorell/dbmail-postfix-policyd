@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -w
 
 # dbmail-postfix-policyd: a Postfix policy server for DBmail
 # Copyright 2005,2011 (c) Jesse Norell
@@ -75,6 +75,43 @@ sub read_dbmail_conf($$)
     return 0;
 }
 
+# set_dbmail_quota_statements sets up sql statements depending
+# on dbmail version and any other relevant settings.
+# Note: this does not prepare the statements (sql), just saves the query
+sub set_dbmail_quota_statements($)
+{
+    my ($self) = @_;
+
+    # prefixed table names
+    my $t_aliases = "$self->{dbmail_postfix_policyd}{table_prefix}aliases";
+    my $t_users = "$self->{dbmail_postfix_policyd}{table_prefix}users";
+    my $t_mailboxes = "$self->{dbmail_postfix_policyd}{table_prefix}mailboxes";
+    my $t_messages = "$self->{dbmail_postfix_policyd}{table_prefix}messages";
+
+    my $d=$self->{dbmail_postfix_policyd};
+
+    # alias statement is currently the same for all dbmail versions:
+    $d->{alias_stmt} = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
+
+    if ($self->{dbmail_postfix_policyd}{dbmail_version} == 1) {
+	$d->{quota_stmt} = "SELECT maxmail_size, SUM(messagesize) AS curmail_size "
+		. "FROM $t_users, mailboxes "
+		. "join messages on ${t_messages}.mailbox_idnr = ${t_mailboxes}.mailbox_idnr "
+		. "where user_idnr = ? "
+        	. "and owner_idnr = user_idnr "
+        	. "and status < 2 "
+		. "group by user_idnr, maxmail_size ";
+	$d->{quota_by_userid_stmt} = "";
+    } elsif ($self->{dbmail_postfix_policyd}{dbmail_version} == 2) {
+	$d->{quota_stmt} = "SELECT maxmail_size, curmail_size from $t_users "
+		. " where user_idnr = ?";
+	$d->{quota_by_userid_stmt} = "SELECT maxmail_size, curmail_size from $t_users "
+		. " where lower(userid) = ?";
+    }
+
+    return 0;
+}
+
 # main routine: based on attributes specified as argument, return policy decision
 sub smtpd_access_policy($$)
 {
@@ -99,7 +136,7 @@ sub smtpd_access_policy($$)
 # If any of them is under quota, we must allow the message (return 0).
 # If any recipients are forwarded externally or execute a command, allow the message.
 # Return true (1) only if all recipients would exceed quota.
-sub dbmail_quota_check($$)
+sub dbmail_quota_check($$$)
 {
     my ($self, $recipient, $size) = @_;
 
@@ -110,9 +147,9 @@ sub dbmail_quota_check($$)
 
     # The v1 and v2 checks have a lot of overlap, but the logic is cleaner if kept separate
     if ($self->{dbmail_postfix_policyd}{dbmail_version} == 1) {
-	return dbmail_v1_quota_check($self, $recipient, $size);
+	return &dbmail_v1_quota_check($self, $recipient, $size);
     } elsif ($self->{dbmail_postfix_policyd}{dbmail_version} == 2) {
-	return dbmail_v2_quota_check($self, $recipient, $size);
+	return &dbmail_v2_quota_check($self, $recipient, $size);
     }
 
     return 0;
@@ -121,20 +158,16 @@ sub dbmail_quota_check($$)
 # Quota Check for DBMail version 1.2 schema
 # Return true (1) only if all recipients would exceed quota.
 # (see comments at top of dbmail_quota_check())
-sub dbmail_v1_quota_check($$)
+sub dbmail_v1_quota_check($$$)
 {
     my ($self, $recipient, $size) = @_;
     my $dbh = $self->{dbmail_postfix_policyd}{dbh};
-    my $alias_sth = $self->{dbmail_postfix_policyd}{alias_sth};
-    my $quota_sth = $self->{dbmail_postfix_policyd}{quota_sth};
-    my $quota_by_userid_sth = $self->{dbmail_postfix_policyd}{quota_by_userid_sth};
+    my ($alias_sth, $quota_sth, $quota_by_userid_sth);
+    my $alias_stmt = $self->{dbmail_postfix_policyd}{alias_stmt};
+    my $quota_stmt = $self->{dbmail_postfix_policyd}{quota_stmt};
+    my $quota_by_userid_stmt = $self->{dbmail_postfix_policyd}{quota_by_userid_stmt};
     my ($query, @row, $numrows, $max, $cur);
     my ($deliver_to, @user_idnrs, @recurse);
-
-    my $t_aliases = "$self->{dbmail_postfix_policyd}{table_prefix}aliases";
-    my $t_users = "$self->{dbmail_postfix_policyd}{table_prefix}users";
-    my $t_mailboxes = "$self->{dbmail_postfix_policyd}{table_prefix}mailboxes";
-    my $t_messages = "$self->{dbmail_postfix_policyd}{table_prefix}messages";
 
     unless ($recipient = lc($recipient)) { return 0; }
     unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
@@ -145,12 +178,10 @@ sub dbmail_v1_quota_check($$)
 	return 0;
     }
 
-    unless ($alias_sth) {
-	$query = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
-	$alias_sth = $dbh->prepare($query);
-	$self->{dbmail_postfix_policyd}{alias_sth} = $alias_sth;
-    }
+# FIXME: check return values
+    $alias_sth = $dbh->prepare_cached($alias_stmt,{},1);
     $alias_sth->execute($recipient);
+
     for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
 	$deliver_to = $row[0];
 
@@ -167,7 +198,7 @@ sub dbmail_v1_quota_check($$)
 
     # recursive lookups of mail forwards
     foreach my $recip (@recurse) {
-	dbmail_v1_quota_check($self, $recip, $size) || return 0;
+	&dbmail_v1_quota_check($self, $recip, $size) || return 0;
     }
 
     # at this point, dbmail 1.2 should have all user_idnr's in @user_idnrs,
@@ -182,17 +213,8 @@ sub dbmail_v1_quota_check($$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
-	unless ($quota_sth) {
-	    $query = "SELECT maxmail_size, SUM(messagesize) AS curmail_size "
-		. "FROM $t_users, mailboxes "
-		. "join messages on ${t_messages}.mailbox_idnr = ${t_mailboxes}.mailbox_idnr "
-		. "where user_idnr = ? "
-        	. "and owner_idnr = user_idnr "
-        	. "and status < 2 "
-		. "group by user_idnr, maxmail_size ";
-	    $quota_sth = $dbh->prepare($query);
-	    $self->{dbmail_postfix_policyd}{quota_sth} = $quota_sth;
-	}
+# FIXME: check return values
+	$quota_sth = $dbh->prepare_cached($quota_stmt,{},1);
 	$quota_sth->execute($user_idnr);
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
@@ -209,20 +231,16 @@ sub dbmail_v1_quota_check($$)
 # Quota Check for DBMail version 2.x schema
 # Return true (1) only if all recipients would exceed quota.
 # (see comments at top of dbmail_quota_check())
-sub dbmail_v2_quota_check($$)
+sub dbmail_v2_quota_check($$$)
 {
     my ($self, $recipient, $size) = @_;
     my $dbh = $self->{dbmail_postfix_policyd}{dbh};
-    my $alias_sth = $self->{dbmail_postfix_policyd}{alias_sth};
-    my $quota_sth = $self->{dbmail_postfix_policyd}{quota_sth};
-    my $quota_by_userid_sth = $self->{dbmail_postfix_policyd}{quota_by_userid_sth};
+    my ($alias_sth, $quota_sth, $quota_by_userid_sth);
+    my $alias_stmt = $self->{dbmail_postfix_policyd}{alias_stmt};
+    my $quota_stmt = $self->{dbmail_postfix_policyd}{quota_stmt};
+    my $quota_by_userid_stmt = $self->{dbmail_postfix_policyd}{quota_by_userid_stmt};
     my ($query, @row, $numrows, $max, $cur);
     my ($deliver_to, @user_idnrs, @recurse);
-
-    my $t_aliases = "$self->{dbmail_postfix_policyd}{table_prefix}aliases";
-    my $t_users = "$self->{dbmail_postfix_policyd}{table_prefix}users";
-    my $t_mailboxes = "$self->{dbmail_postfix_policyd}{table_prefix}mailboxes";
-    my $t_messages = "$self->{dbmail_postfix_policyd}{table_prefix}messages";
 
     unless ($recipient = lc($recipient)) { return 0; }
     unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
@@ -233,12 +251,10 @@ sub dbmail_v2_quota_check($$)
 	return 0;
     }
 
-    unless ($alias_sth) {
-	$query = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
-	$alias_sth = $dbh->prepare($query);
-	$self->{dbmail_postfix_policyd}{alias_sth} = $alias_sth;
-    }
+# FIXME: check return values
+    $alias_sth = $dbh->prepare_cached($alias_stmt,{},1);
     $alias_sth->execute($recipient);
+
     for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
 	$deliver_to = $row[0];
 
@@ -255,7 +271,7 @@ sub dbmail_v2_quota_check($$)
 
     # recursive lookups of mail forwards
     foreach my $recip (@recurse) {
-	dbmail_v2_quota_check($self, $recip, $size) || return 0;
+	&dbmail_v2_quota_check($self, $recip, $size) || return 0;
     }
 
     # at this point, dbmail 2.x may have all user_idnr's in @user_idnrs,
@@ -266,12 +282,8 @@ sub dbmail_v2_quota_check($$)
     # TODO:  need to add user@ and @domain catchall lookups
 
     if ($numrows == 0) {
-	unless ($quota_by_userid_sth) {
-	    $query = "SELECT maxmail_size, curmail_size from $t_users "
-		. " where lower(userid) = ?";
-	    $quota_by_userid_sth = $dbh->prepare($query);
-	    $self->{dbmail_postfix_policyd}{quota_by_userid_sth} = $quota_by_userid_sth;
-	}
+# FIXME: check return values
+	$quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1);
 	$quota_by_userid_sth->execute($recipient);
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ) {
@@ -285,12 +297,8 @@ sub dbmail_v2_quota_check($$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
-	unless ($quota_sth) {
-	    $query = "SELECT maxmail_size, curmail_size from $t_users "
-		. " where user_idnr = ?";
-	    $quota_sth = $dbh->prepare($query);
-	    $self->{dbmail_postfix_policyd}{quota_sth} = $quota_sth;
-	}
+# FIXME: check return values
+	$quota_sth = $dbh->prepare_cached($quota_stmt,{},1);
 	$quota_sth->execute($user_idnr);
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
@@ -470,7 +478,6 @@ sub main()
 }
 
 
-
 ##### Net::Server::Multiplex methods:
 
 # reload dbmail.conf on HUP, completely untested, may be incomplete or broken
@@ -532,6 +539,8 @@ sub pre_loop_hook()
       $self->{dbmail_postfix_policyd}{dbuser},
       $self->{dbmail_postfix_policyd}{dbpass},
       { RaiseError => 1, AutoCommit => 1 } ) || die "Error connecting to database: $DBI::errstr\n";
+
+    set_dbmail_quota_statements($self);
 }
 
 sub mux_input()
@@ -678,6 +687,10 @@ to the after-filter smtp server.
 =back
 
 =head1 SEE ALSO
+
+See L<https://github.com/jnorell/dbmail-postfix-policyd> for
+the latest version of dbmail-postfix-policyd and any other 
+project goodies.
 
 See L<http://www.dbmail.org/> for more information on
 dbmail.
