@@ -8,6 +8,7 @@
 # released under the GNU General Public License
 
 # see the documentation with 'perldoc dbmail-postfix-policyd'
+# and check https://github.com/jnorell/dbmail-postfix-policyd for more
 
 package dbmail_postfix_policyd;
 use strict;
@@ -81,19 +82,18 @@ sub read_dbmail_conf($$)
 sub set_dbmail_quota_statements($)
 {
     my ($self) = @_;
+    my $d=$self->{dbmail_postfix_policyd};
 
     # prefixed table names
-    my $t_aliases = "$self->{dbmail_postfix_policyd}{table_prefix}aliases";
-    my $t_users = "$self->{dbmail_postfix_policyd}{table_prefix}users";
-    my $t_mailboxes = "$self->{dbmail_postfix_policyd}{table_prefix}mailboxes";
-    my $t_messages = "$self->{dbmail_postfix_policyd}{table_prefix}messages";
-
-    my $d=$self->{dbmail_postfix_policyd};
+    my $t_aliases = "$d->{table_prefix}aliases";
+    my $t_users = "$d->{table_prefix}users";
+    my $t_mailboxes = "$d->{table_prefix}mailboxes";
+    my $t_messages = "$d->{table_prefix}messages";
 
     # alias statement is currently the same for all dbmail versions:
     $d->{alias_stmt} = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
 
-    if ($self->{dbmail_postfix_policyd}{dbmail_version} == 1) {
+    if ($d->{dbmail_version} == 1) {
 	$d->{quota_stmt} = "SELECT maxmail_size, SUM(messagesize) AS curmail_size "
 		. "FROM $t_users, mailboxes "
 		. "join messages on ${t_messages}.mailbox_idnr = ${t_mailboxes}.mailbox_idnr "
@@ -102,7 +102,7 @@ sub set_dbmail_quota_statements($)
         	. "and status < 2 "
 		. "group by user_idnr, maxmail_size ";
 	$d->{quota_by_userid_stmt} = "";
-    } elsif ($self->{dbmail_postfix_policyd}{dbmail_version} == 2) {
+    } elsif ($d->{dbmail_version} == 2) {
 	$d->{quota_stmt} = "SELECT maxmail_size, curmail_size from $t_users "
 		. " where user_idnr = ?";
 	$d->{quota_by_userid_stmt} = "SELECT maxmail_size, curmail_size from $t_users "
@@ -286,7 +286,7 @@ sub dbmail_v2_quota_check($$$)
 	$quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1);
 	$quota_by_userid_sth->execute($recipient);
 
-	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ) {
+	for ($numrows=0; ($max, $cur) = $quota_by_userid_sth->fetchrow_array; $numrows++ ) {
 	    ($max == 0) && return 0;
 	    ($cur + $size <= $max) && return 0;
 	}
@@ -539,6 +539,11 @@ sub pre_loop_hook()
       $self->{dbmail_postfix_policyd}{dbuser},
       $self->{dbmail_postfix_policyd}{dbpass},
       { RaiseError => 1, AutoCommit => 1 } ) || die "Error connecting to database: $DBI::errstr\n";
+
+    if ($dbd_type =~ m/mysql/) {
+	$self->log(4, "Setting mysql_auto_reconnect");
+	$self->{dbmail_postfix_policyd}{dbh}->{mysql_auto_reconnect} = 1;
+    }
 
     set_dbmail_quota_statements($self);
 }
