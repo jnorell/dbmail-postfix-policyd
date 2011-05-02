@@ -76,13 +76,49 @@ sub read_dbmail_conf($$)
     return 0;
 }
 
-# set_dbmail_quota_statements sets up sql statements depending
-# on dbmail version and any other relevant settings.
-# Note: this does not prepare the statements (sql), just saves the query
-sub set_dbmail_quota_statements($)
+# db_reconnect closes any open db connection, reconnects to the server,
+#   then sets up sql statements depending on dbmail version, etc.
+# Note this does not prepare the statements (sql), just saves the query
+sub db_reconnect($)
 {
     my ($self) = @_;
+    my ($dbd_type, $data_source);
     my $d=$self->{dbmail_postfix_policyd};
+
+    # open database connection and save the handle in $self->{server}
+    if ($d->{dbtype} =~ m/^pgsql$/i) {
+      $dbd_type='Pg';
+    } elsif ($d->{dbtype} =~ m/^mysql$/i) {
+      $dbd_type='mysql';
+    } elsif ($d->{dbtype} =~ m/^sqlite$/i) {
+      $dbd_type='SQLite';
+    } else {
+      die "pre_loop_hook: unknown dbtype: this should not have happened!\n";
+    }
+    $data_source="dbi:$dbd_type:dbname=$d->{dbdb}";
+
+    # if database connection is open, close it
+    if ($d->{dbh}->{Active}) {
+	$self->log(4, "db_reconnect: database is Active, disconnecting");
+	$d->{dbh}->disconnect();
+    }
+
+    if (defined $d->{dbhost}) {
+	$data_source .= ";host=$d->{dbhost}";
+	if (defined $d->{dbsqlport}) {
+	    $data_source .= ";port=$d->{dbsqlport}";
+	}
+    } elsif (defined $d->{dbsqlsocket}) {
+	$data_source .= ";host=$d->{dbsqlsocket}";
+    }
+
+    $d->{dbh} = DBI->connect($data_source, $d->{dbuser}, $d->{dbpass},
+      { RaiseError => 1, AutoCommit => 1 } ) || die "Error connecting to database: $DBI::errstr\n";
+
+    if ($dbd_type =~ m/mysql/) {
+	$self->log(4, "db_reconnect: Setting mysql_auto_reconnect");
+	$d->{dbh}->{mysql_auto_reconnect} = 1;
+    }
 
     # prefixed table names
     my $t_aliases = "$d->{table_prefix}aliases";
@@ -112,6 +148,7 @@ sub set_dbmail_quota_statements($)
     return 0;
 }
 
+
 # main routine: based on attributes specified as argument, return policy decision
 sub smtpd_access_policy($$)
 {
@@ -139,16 +176,22 @@ sub smtpd_access_policy($$)
 sub dbmail_quota_check($$$)
 {
     my ($self, $recipient, $size) = @_;
+    my $d=$self->{dbmail_postfix_policyd};
 
     unless ($recipient) { return 0; }
     unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
 
     $quota_recurse_depth = 0;
 
+    unless ($d->{dbh}->{Active}) {
+	$self->log(4, "dbmail_quota_check:  database NOT Active, reconnecting");
+	&db_reconnect($self);
+    }
+
     # The v1 and v2 checks have a lot of overlap, but the logic is cleaner if kept separate
-    if ($self->{dbmail_postfix_policyd}{dbmail_version} == 1) {
+    if ($d->{dbmail_version} == 1) {
 	return &dbmail_v1_quota_check($self, $recipient, $size);
-    } elsif ($self->{dbmail_postfix_policyd}{dbmail_version} == 2) {
+    } elsif ($d->{dbmail_version} == 2) {
 	return &dbmail_v2_quota_check($self, $recipient, $size);
     }
 
@@ -178,9 +221,11 @@ sub dbmail_v1_quota_check($$$)
 	return 0;
     }
 
-# FIXME: check return values
     $alias_sth = $dbh->prepare_cached($alias_stmt,{},1);
-    $alias_sth->execute($recipient);
+    unless( $alias_sth->execute($recipient) ) {
+	$self->log(2, "dbmail_v1_quota_check: alias_sth: $alias_sth->errstr");
+	return 0;
+    }
 
     for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
 	$deliver_to = $row[0];
@@ -213,9 +258,11 @@ sub dbmail_v1_quota_check($$$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
-# FIXME: check return values
 	$quota_sth = $dbh->prepare_cached($quota_stmt,{},1);
-	$quota_sth->execute($user_idnr);
+	unless( $quota_sth->execute($user_idnr) ) {
+	    $self->log(2, "dbmail_v1_quota_check: quota_sth: $quota_sth->errstr");
+	    return 0;
+	}
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
 	    ($max == 0) && return 0;
@@ -251,9 +298,11 @@ sub dbmail_v2_quota_check($$$)
 	return 0;
     }
 
-# FIXME: check return values
     $alias_sth = $dbh->prepare_cached($alias_stmt,{},1);
-    $alias_sth->execute($recipient);
+    unless( $alias_sth->execute($recipient) ) {
+	$self->log(2, "dbmail_v2_quota_check: alias_sth: $alias_sth->errstr");
+	return 0;
+    }
 
     for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
 	$deliver_to = $row[0];
@@ -282,9 +331,11 @@ sub dbmail_v2_quota_check($$$)
     # TODO:  need to add user@ and @domain catchall lookups
 
     if ($numrows == 0) {
-# FIXME: check return values
 	$quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1);
-	$quota_by_userid_sth->execute($recipient);
+	unless( $quota_by_userid_sth->execute($recipient) ) {
+	    $self->log(2, "dbmail_v2_quota_check: quota_by_userid_sth: $quota_by_userid_sth->errstr");
+	    return 0;
+	}
 
 	for ($numrows=0; ($max, $cur) = $quota_by_userid_sth->fetchrow_array; $numrows++ ) {
 	    ($max == 0) && return 0;
@@ -297,9 +348,11 @@ sub dbmail_v2_quota_check($$$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
-# FIXME: check return values
 	$quota_sth = $dbh->prepare_cached($quota_stmt,{},1);
-	$quota_sth->execute($user_idnr);
+	unless( $quota_sth->execute($user_idnr) ) {
+	    $self->log(2, "dbmail_v2_quota_check: quota_sth: $quota_sth->errstr");
+	    return 0;
+	}
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
 	    ($max == 0) && return 0;
@@ -364,7 +417,6 @@ sub main()
             syslog_logsock   => $^O eq 'solaris' ? 'inet' : 'unix',
             syslog_facility  => 'mail',
             syslog_ident     => 'dbmail-postfix-policyd',
-		# need to hold the database connection (and a lock, if needed) here
         },
         dbmail_postfix_policyd => {
             dbmail_conf      => $opt{'dbmail-conf'} ? $opt{'dbmail-conf'} : '/etc/dbmail/dbmail.conf',
@@ -377,6 +429,7 @@ sub main()
             dbpass           => $opt{dbpass} ? $opt{dbpass} : undef,
             dbdb             => $opt{dbdb} ? $opt{dbdb} : undef,
             table_prefix     => $opt{table_prefix} ? $opt{table_prefix} : undef,
+            dbh              => undef,
         },
     }, 'dbmail_postfix_policyd';
 
@@ -401,7 +454,7 @@ sub main()
 	 	$server->{dbmail_postfix_policyd}{dbtype} = 'pgsql';
 	    }
 	    if ((/^mysql$/) or (/^sqlite$/)) {
-	 	$server->{dbmail_postfix_policyd}{dbtype} = $server->{dbmail_postfix_policyd}{dbdriver};
+	 	$server->{dbmail_postfix_policyd}{dbtype} = $_;
 	    }
 	} else {
             die "ERROR: dbtype required (mysql or pgsql)\n";
@@ -484,19 +537,16 @@ sub main()
 #sub sig_hup {
 #    my $self = shift;
 #    $self->{net_server}->log(2, "HUP received: reloading dbmail.conf...");
-#    $self->read_dbmail_conf();
-#	# this in particular may be wrong:
-#    if (defined &{$self->{dbmail_postfix_policyd}{dbh}->disconnect}) {
-#    	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
+#    if ($self->{dbmail_postfix_policyd}{dbh}->{Active}) {
+#	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
 #    }
-#    $self->{dbmail_postfix_policyd}{dbh} = {};
+#    $self->read_dbmail_conf();
 #    pre_loop_hook($self)
 #}
 
 sub pre_loop_hook()
 {
     my ($self) = @_;
-    my ($dbd_type, $data_source);
 
     # write files with mode 600
     umask 0077;
@@ -514,38 +564,7 @@ sub pre_loop_hook()
         $SIG{__DIE__}  = sub { Sys::Syslog::syslog('crit', "fatal: $_[0]"); die @_; };
     }
 
-    # open database connection and save the handle in $self->{server}
-    if ($self->{dbmail_postfix_policyd}{dbtype} =~ m/^pgsql$/i) {
-      $dbd_type='Pg';
-    } elsif ($self->{dbmail_postfix_policyd}{dbtype} =~ m/^mysql$/i) {
-      $dbd_type='mysql';
-    } elsif ($self->{dbmail_postfix_policyd}{dbtype} =~ m/^sqlite$/i) {
-      $dbd_type='SQLite';
-    } else {
-      die "pre_loop_hook: unknown dbtype: this should not have happened!\n";
-    }
-    $data_source="dbi:$dbd_type:dbname=$self->{dbmail_postfix_policyd}{dbdb}";
-
-    if (defined $self->{dbmail_postfix_policyd}{dbhost}) {
-	$data_source .= ";host=$self->{dbmail_postfix_policyd}{dbhost}";
-	if (defined $self->{dbmail_postfix_policyd}{dbsqlport}) {
-	    $data_source .= ";port=$self->{dbmail_postfix_policyd}{dbsqlport}";
-	}
-    } elsif (defined $self->{dbmail_postfix_policyd}{dbsqlsocket}) {
-	$data_source .= ";host=$self->{dbmail_postfix_policyd}{dbsqlsocket}";
-    }
-
-    $self->{dbmail_postfix_policyd}{dbh} = DBI->connect($data_source,
-      $self->{dbmail_postfix_policyd}{dbuser},
-      $self->{dbmail_postfix_policyd}{dbpass},
-      { RaiseError => 1, AutoCommit => 1 } ) || die "Error connecting to database: $DBI::errstr\n";
-
-    if ($dbd_type =~ m/mysql/) {
-	$self->log(4, "Setting mysql_auto_reconnect");
-	$self->{dbmail_postfix_policyd}{dbh}->{mysql_auto_reconnect} = 1;
-    }
-
-    set_dbmail_quota_statements($self);
+    &db_reconnect($self);
 }
 
 sub mux_input()
