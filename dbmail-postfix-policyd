@@ -403,7 +403,7 @@ sub main()
     if($opt{noaction}) { die "ERROR: don't know how to \"no-action\".\n" }
 
     defined $opt{unix} or defined $opt{inet} or
-        die "ERROR: --unix or --inet must be specified\n";
+        $opt{inet} = "60002";
 
     # bind only localhost if no host is specified
     if(defined $opt{inet} and $opt{inet}=~/^\d+$/) {
@@ -639,7 +639,7 @@ B<dbmail-postfix-policyd> [I<options>...]
  -v, --verbose           increase verbosity level
 
  -u, --unix=PATH         listen on unix socket PATH
- -i, --inet=[HOST:]PORT  listen on PORT, localhost if HOST is not specified
+ -i, --inet=[HOST:]PORT  listen on PORT (default: 60002), localhost if HOST is not specified
  -d, --daemonize         run in the background
      --pidfile=PATH      put daemon pid into this file
      --user=USER         run as USER (default: dbmail)
@@ -699,11 +699,11 @@ Create a C<dbmail> user and /etc/dbmail/dbmail.conf config file
 Write an init script to start dbmail-postfix-policyd at boot and start it.
 Like this for example:
 
- dbmail-postfix-policyd --inet=60001 -d
+ dbmail-postfix-policyd -d
 
 or:
 
- dbmail-postfix-policyd --inet=60001 -d -f=/etc/dbmail.conf -V=1 --dbtype=mysql
+ dbmail-postfix-policyd --inet=60002 -d -f=/etc/dbmail.conf -V=1 --dbtype=mysql
 
 =item *
 
@@ -713,10 +713,10 @@ Configure postfix to use the policy service with something like this in
  smtpd_recipient_restrictions =
                ...
                reject_unauth_destination
-               check_policy_service inet:127.0.0.1:60001
+               check_policy_service inet:127.0.0.1:60002
 
  smtpd_end_of_data_restrictions =
-               check_policy_service inet:127.0.0.1:60001
+               check_policy_service inet:127.0.0.1:60002
 
 If your postfix setup uses an after-queue content filter
 (eg. for spam or virus scanning), add a
@@ -753,9 +753,6 @@ Improve logging (content and destination).
 =item -
 Handle errors/restarts, maybe create a watcher script or 
 test performance running as a service right from master.cf.
-
-=item -
-Choose/add a default port number.
 
 =item -
 Capability to prompt for database password.
