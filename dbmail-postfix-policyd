@@ -289,7 +289,7 @@ sub dbmail_v1_quota_check($$$)
 		return 0;
 	    }
 	    if ($cur + $size <= $max) {
-		$self->log(4, "dbmail_v1_quota_check: user_idnr $user_idnr still under quota, accepting");
+		$self->log(4, "dbmail_v1_quota_check: user_idnr $user_idnr still under quota [$max], accepting");
 		return 0;
 	    }
 	}
@@ -387,7 +387,7 @@ sub dbmail_v2_quota_check($$$)
 		return 0;
 	    }
 	    if ($cur + $size <= $max) {
-		$self->log(4, "dbmail_v2_quota_check: userid $recipient still under quota, accepting");
+		$self->log(4, "dbmail_v2_quota_check: userid $recipient still under quota [$max], accepting");
 		return 0;
 	    }
 	}
@@ -417,7 +417,7 @@ sub dbmail_v2_quota_check($$$)
 		return 0;
 	    }
 	    if ($cur + $size <= $max) {
-		$self->log(4, "dbmail_v2_quota_check: user_idnr $user_idnr still under quota, accepting");
+		$self->log(4, "dbmail_v2_quota_check: user_idnr $user_idnr still under quota [$max], accepting");
 		return 0;
 	    }
 	}
