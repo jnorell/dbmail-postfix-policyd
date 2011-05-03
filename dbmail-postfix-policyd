@@ -221,7 +221,10 @@ sub dbmail_v1_quota_check($$$)
 	return 0;
     }
 
-    $alias_sth = $dbh->prepare_cached($alias_stmt,{},1);
+    unless( $alias_sth = $dbh->prepare_cached($alias_stmt,{},1) ) {
+	$self->log(2, "dbmail_v1_quota_check: prepare_cached(alias_sth): $dbh->errstr");
+	return 0;
+    }
     unless( $alias_sth->execute($recipient) ) {
 	$self->log(2, "dbmail_v1_quota_check: alias_sth: $alias_sth->errstr");
 	return 0;
@@ -258,7 +261,10 @@ sub dbmail_v1_quota_check($$$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
-	$quota_sth = $dbh->prepare_cached($quota_stmt,{},1);
+	unless( $quota_sth = $dbh->prepare_cached($quota_stmt,{},1) ) {
+	    $self->log(2, "dbmail_v1_quota_check: prepare_cached(quota_sth): $dbh->errstr");
+	    return 0;
+	}
 	unless( $quota_sth->execute($user_idnr) ) {
 	    $self->log(2, "dbmail_v1_quota_check: quota_sth: $quota_sth->errstr");
 	    return 0;
@@ -298,7 +304,10 @@ sub dbmail_v2_quota_check($$$)
 	return 0;
     }
 
-    $alias_sth = $dbh->prepare_cached($alias_stmt,{},1);
+    unless( $alias_sth = $dbh->prepare_cached($alias_stmt,{},1) ) {
+	$self->log(2, "dbmail_v2_quota_check: prepare_cached(alias_sth): $dbh->errstr");
+	return 0;
+    }
     unless( $alias_sth->execute($recipient) ) {
 	$self->log(2, "dbmail_v2_quota_check: alias_sth: $alias_sth->errstr");
 	return 0;
@@ -331,7 +340,10 @@ sub dbmail_v2_quota_check($$$)
     # TODO:  need to add user@ and @domain catchall lookups
 
     if ($numrows == 0) {
-	$quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1);
+	unless( $quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1) ) {
+	    $self->log(2, "dbmail_v2_quota_check: prepare_cached(quota_by_userid_sth): $dbh->errstr");
+	    return 0;
+	}
 	unless( $quota_by_userid_sth->execute($recipient) ) {
 	    $self->log(2, "dbmail_v2_quota_check: quota_by_userid_sth: $quota_by_userid_sth->errstr");
 	    return 0;
@@ -348,7 +360,10 @@ sub dbmail_v2_quota_check($$$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
-	$quota_sth = $dbh->prepare_cached($quota_stmt,{},1);
+	unless( $quota_sth = $dbh->prepare_cached($quota_stmt,{},1) ) {
+	    $self->log(2, "dbmail_v2_quota_check: prepare_cached(quota_sth): $dbh->errstr");
+	    return 0;
+	}
 	unless( $quota_sth->execute($user_idnr) ) {
 	    $self->log(2, "dbmail_v2_quota_check: quota_sth: $quota_sth->errstr");
 	    return 0;
