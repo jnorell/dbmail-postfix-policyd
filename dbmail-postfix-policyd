@@ -26,10 +26,22 @@ my $VERSION = "0.01";
 my $hostname = hostname;
 my $quota_recurse_depth = 0;
 
+# strips comments/whitespace from ini file values
+sub ini_cleanup($)
+{
+    my $str = shift;
+
+    $str =~ s/#.*//;
+    $str =~ s/^\s+//;
+    $str =~ s/\s+$//;
+
+    return $str;
+}
+
 sub read_dbmail_conf($$)
 {
     my ($self, $fatal) = @_;
-    my %ini;
+    my (%ini, $val);
 
     if ((! defined $self->{dbmail_postfix_policyd}{dbmail_conf}) or
         (! -r $self->{dbmail_postfix_policyd}{dbmail_conf})        ) {
@@ -41,36 +53,44 @@ sub read_dbmail_conf($$)
       or $fatal and die "ERROR: $self->{dbmail_postfix_policyd}{dbmail_conf}: $!\n";
 
     if (defined $ini{DBMAIL}{driver}) {
-      $self->log(4, "read {DBMAIL}{driver}: $ini{DBMAIL}{driver}");
-      $self->{dbmail_postfix_policyd}{dbdriver} = $ini{DBMAIL}{driver};
+      $val = ini_cleanup($ini{DBMAIL}{driver});
+      $self->log(4, "read {DBMAIL}{driver}: $val");
+      $self->{dbmail_postfix_policyd}{dbdriver} = $val;
     }
     if (defined $ini{DBMAIL}{host}) {
-      $self->log(4, "read {DBMAIL}{host}: $ini{DBMAIL}{host}");
-      $self->{dbmail_postfix_policyd}{dbhost} = $ini{DBMAIL}{host};
+      $val = ini_cleanup($ini{DBMAIL}{host});
+      $self->log(4, "read {DBMAIL}{host}: $val");
+      $self->{dbmail_postfix_policyd}{dbhost} = $val;
     }
     if (defined $ini{DBMAIL}{sqlport}) {
-      $self->log(4, "read {DBMAIL}{sqlport}: $ini{DBMAIL}{sqlport}");
-      $self->{dbmail_postfix_policyd}{dbsqlport} = $ini{DBMAIL}{sqlport};
+      $val = ini_cleanup($ini{DBMAIL}{sqlport});
+      $self->log(4, "read {DBMAIL}{sqlport}: $val");
+      $self->{dbmail_postfix_policyd}{dbsqlport} = $val;
     }
     if (defined $ini{DBMAIL}{sqlsocket}) {
-      $self->log(4, "read {DBMAIL}{sqlsocket}: $ini{DBMAIL}{sqlsocket}");
-      $self->{dbmail_postfix_policyd}{dbsqlsocket} = $ini{DBMAIL}{sqlsocket};
+      $val = ini_cleanup($ini{DBMAIL}{sqlsocket});
+      $self->log(4, "read {DBMAIL}{sqlsocket}: $val");
+      $self->{dbmail_postfix_policyd}{dbsqlsocket} = $val;
     }
     if (defined $ini{DBMAIL}{user}) {
-      $self->log(4, "read {DBMAIL}{user}: $ini{DBMAIL}{user}");
-      $self->{dbmail_postfix_policyd}{dbuser} = $ini{DBMAIL}{user};
+      $val = ini_cleanup($ini{DBMAIL}{user});
+      $self->log(4, "read {DBMAIL}{user}: $val");
+      $self->{dbmail_postfix_policyd}{dbuser} = $val;
     }
     if (defined $ini{DBMAIL}{pass}) {
-      $self->log(4, "read {DBMAIL}{pass}: $ini{DBMAIL}{pass}");
-      $self->{dbmail_postfix_policyd}{dbpass} = $ini{DBMAIL}{pass};
+      $val = ini_cleanup($ini{DBMAIL}{pass});
+      $self->log(4, "read {DBMAIL}{pass}: $val");
+      $self->{dbmail_postfix_policyd}{dbpass} = $val;
     }
     if (defined $ini{DBMAIL}{db}) {
-      $self->log(4, "read {DBMAIL}{db}: $ini{DBMAIL}{db}");
-      $self->{dbmail_postfix_policyd}{dbdb} = $ini{DBMAIL}{db};
+      $val = ini_cleanup($ini{DBMAIL}{db});
+      $self->log(4, "read {DBMAIL}{db}: $val");
+      $self->{dbmail_postfix_policyd}{dbdb} = $val;
     }
     if (defined $ini{DBMAIL}{table_prefix}) {
-      $self->log(4, "read {DBMAIL}{table_prefix}: $ini{DBMAIL}{table_prefix}");
-      $self->{dbmail_postfix_policyd}{table_prefix} = $ini{DBMAIL}{table_prefix};
+      $val = ini_cleanup($ini{DBMAIL}{table_prefix});
+      $self->log(4, "read {DBMAIL}{table_prefix}: $val");
+      $self->{dbmail_postfix_policyd}{table_prefix} = $val;
     }
 
     return 0;
@@ -85,6 +105,28 @@ sub db_reconnect($)
     my ($dbd_type, $data_source);
     my $d=$self->{dbmail_postfix_policyd};
 
+    # if database connection is open, close it
+    if ($d->{dbh}->{Active}) {
+	my ($alias_sth, $quota_sth, $quota_by_userid_sth);
+
+	# finish active statement handlers
+	local $d->{dbh}->{RaiseError} = 0;
+	if ($alias_sth = $d->{dbh}->prepare_cached($d->{alias_stmt},{},1)) {
+	    if ($alias_sth->{Active}) { $alias_sth->finish(); }
+	}
+	if ($quota_sth = $d->{dbh}->prepare_cached($d->{quota_stmt},{},1)) {
+	    if ($quota_sth->{Active}) { $quota_sth->finish(); }
+	}
+	if ($quota_by_userid_sth = $d->{dbh}->prepare_cached($d->{quota_by_userid_stmt},{},1)) {
+	    if ($quota_by_userid_sth->{Active}) { $quota_by_userid_sth->finish(); }
+	}
+	$d->{dbh}->{RaiseError} = 1;
+
+	$self->log(4, "db_reconnect: Database is Active, disconnecting");
+	$d->{dbh}->disconnect();
+	$d->{dbh} = undef;
+    }
+
     # open database connection and save the handle in $self->{server}
     if ($d->{dbtype} =~ m/^pgsql$/i) {
       $dbd_type='Pg';
@@ -96,13 +138,6 @@ sub db_reconnect($)
       die "db_reconnect: unknown dbtype ($d->{dbtype})!\n";
     }
     $data_source="dbi:$dbd_type:dbname=$d->{dbdb}";
-
-    # if database connection is open, close it
-    if ($d->{dbh}->{Active}) {
-	$self->log(4, "db_reconnect: Database is Active, disconnecting");
-	$d->{dbh}->disconnect();
-	$d->{dbh} = undef;
-    }
 
     if (defined $d->{dbhost}) {
 	$data_source .= ";host=$d->{dbhost}";
@@ -122,28 +157,23 @@ sub db_reconnect($)
 	$d->{dbh}->{mysql_auto_reconnect} = 1;
     }
 
-    # prefixed table names
-    my $t_aliases = "$d->{table_prefix}aliases";
-    my $t_users = "$d->{table_prefix}users";
-    my $t_mailboxes = "$d->{table_prefix}mailboxes";
-    my $t_messages = "$d->{table_prefix}messages";
-
     # alias statement is currently the same for all dbmail versions:
-    $d->{alias_stmt} = "SELECT deliver_to from $t_aliases where lower(alias) = ?";
+    $d->{alias_stmt} = "SELECT deliver_to from $d->{table_prefix}aliases where lower(alias) = ?";
 
     if ($d->{dbmail_version} == 1) {
 	$d->{quota_stmt} = "SELECT maxmail_size, SUM(messagesize) AS curmail_size "
-		. "FROM $t_users, mailboxes "
-		. "join messages on ${t_messages}.mailbox_idnr = ${t_mailboxes}.mailbox_idnr "
+		. "FROM $d->{table_prefix}users, $d->{table_prefix}mailboxes "
+		. "join $d->{table_prefix}messages on "
+		. "  $d->{table_prefix}messages.mailbox_idnr = $d->{table_prefix}mailboxes.mailbox_idnr "
 		. "where user_idnr = ? "
         	. "and owner_idnr = user_idnr "
         	. "and status < 2 "
 		. "group by user_idnr, maxmail_size ";
 	$d->{quota_by_userid_stmt} = "";
     } elsif ($d->{dbmail_version} == 2) {
-	$d->{quota_stmt} = "SELECT maxmail_size, curmail_size from $t_users "
+	$d->{quota_stmt} = "SELECT maxmail_size, curmail_size from $d->{table_prefix}users "
 		. " where user_idnr = ?";
-	$d->{quota_by_userid_stmt} = "SELECT maxmail_size, curmail_size from $t_users "
+	$d->{quota_by_userid_stmt} = "SELECT maxmail_size, curmail_size from $d->{table_prefix}users "
 		. " where lower(userid) = ?";
     }
 
@@ -225,6 +255,7 @@ sub dbmail_v1_quota_check($$$)
 	return 0;
     }
 
+    local $dbh->{RaiseError} = 0;
     unless( $alias_sth = $dbh->prepare_cached($alias_stmt,{},1) ) {
 	$self->log(2, "dbmail_v1_quota_check: prepare_cached(alias_sth): $dbh->errstr");
 	return 0;
@@ -233,6 +264,7 @@ sub dbmail_v1_quota_check($$$)
 	$self->log(2, "dbmail_v1_quota_check: alias_sth: $alias_sth->errstr");
 	return 0;
     }
+    $dbh->{RaiseError} = 1;
 
     for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
 	$deliver_to = $row[0];
@@ -274,6 +306,7 @@ sub dbmail_v1_quota_check($$$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
+	local $dbh->{RaiseError} = 0;
 	unless( $quota_sth = $dbh->prepare_cached($quota_stmt,{},1) ) {
 	    $self->log(2, "dbmail_v1_quota_check: prepare_cached(quota_sth): $dbh->errstr");
 	    return 0;
@@ -282,6 +315,7 @@ sub dbmail_v1_quota_check($$$)
 	    $self->log(2, "dbmail_v1_quota_check: quota_sth: $quota_sth->errstr");
 	    return 0;
 	}
+	$dbh->{RaiseError} = 1;
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
 	    if ($max == 0) {
@@ -329,6 +363,7 @@ sub dbmail_v2_quota_check($$$)
 	return 0;
     }
 
+    local $dbh->{RaiseError} = 0;
     unless( $alias_sth = $dbh->prepare_cached($alias_stmt,{},1) ) {
 	$self->log(2, "dbmail_v2_quota_check: prepare_cached(alias_sth): $dbh->errstr");
 	return 0;
@@ -337,6 +372,7 @@ sub dbmail_v2_quota_check($$$)
 	$self->log(2, "dbmail_v2_quota_check: alias_sth: $alias_sth->errstr");
 	return 0;
     }
+    $dbh->{RaiseError} = 1;
 
     for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
 	$deliver_to = $row[0];
@@ -372,6 +408,7 @@ sub dbmail_v2_quota_check($$$)
     if ($numrows == 0) {
 	$self->log(4, "dbmail_v2_quota_check: alias not found, checking for matching userid");
 
+	local $dbh->{RaiseError} = 0;
 	unless( $quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1) ) {
 	    $self->log(2, "dbmail_v2_quota_check: prepare_cached(quota_by_userid_sth): $dbh->errstr");
 	    return 0;
@@ -380,6 +417,7 @@ sub dbmail_v2_quota_check($$$)
 	    $self->log(2, "dbmail_v2_quota_check: quota_by_userid_sth: $quota_by_userid_sth->errstr");
 	    return 0;
 	}
+	$dbh->{RaiseError} = 1;
 
 	for ($numrows=0; ($max, $cur) = $quota_by_userid_sth->fetchrow_array; $numrows++ ) {
 	    if ($max == 0) {
@@ -402,6 +440,7 @@ sub dbmail_v2_quota_check($$$)
     # at this point, all user's ids are in @user_idnrs,
     # we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
+	local $dbh->{RaiseError} = 0;
 	unless( $quota_sth = $dbh->prepare_cached($quota_stmt,{},1) ) {
 	    $self->log(2, "dbmail_v2_quota_check: prepare_cached(quota_sth): $dbh->errstr");
 	    return 0;
@@ -410,6 +449,7 @@ sub dbmail_v2_quota_check($$$)
 	    $self->log(2, "dbmail_v2_quota_check: quota_sth: $quota_sth->errstr");
 	    return 0;
 	}
+	$dbh->{RaiseError} = 1;
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
 	    if ($max == 0) {
@@ -584,8 +624,7 @@ sub main()
 
     if (defined $opt{table_prefix}) {
       $server->{dbmail_postfix_policyd}{table_prefix} = $opt{table_prefix};
-    }
-    else {
+    } elsif (! defined $server->{dbmail_postfix_policyd}{table_prefix}) {
       if ($server->{dbmail_postfix_policyd}{dbmail_version} > 1) {
         $server->{dbmail_postfix_policyd}{table_prefix} = 'dbmail_';
       }
@@ -600,16 +639,20 @@ sub main()
 
 ##### Net::Server::Multiplex methods:
 
-# reload dbmail.conf on HUP, completely untested, may be incomplete or broken
-#sub sig_hup {
-#    my $self = shift;
-#    $self->{net_server}->log(2, "HUP received: reloading dbmail.conf...");
-#    if ($self->{dbmail_postfix_policyd}{dbh}->{Active}) {
-#	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
-#    }
-#    $self->read_dbmail_conf();
-#    pre_loop_hook($self)
-#}
+# reload dbmail.conf on HUP
+sub sig_hup {
+    my $self = shift;
+    $self->log(2, "HUP received: reloading dbmail.conf...");
+    if ($self->{dbmail_postfix_policyd}{dbh}->{Active}) {
+	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
+	$self->{dbmail_postfix_policyd}{dbh} = undef;
+    }
+    # note this allows some settings to be changed via dbmail.conf
+    # that were set via cli options, which could break things
+    # right now that's a feature, not a bug.
+    $self->read_dbmail_conf();
+    pre_loop_hook($self)
+}
 
 sub pre_loop_hook()
 {
