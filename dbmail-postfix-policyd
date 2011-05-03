@@ -124,7 +124,6 @@ sub db_reconnect($)
 
 	$self->log(4, "db_reconnect: Database is Active, disconnecting");
 	$d->{dbh}->disconnect();
-	$d->{dbh} = undef;
     }
 
     # open database connection and save the handle in $self->{server}
@@ -645,7 +644,6 @@ sub sig_hup {
     $self->log(2, "HUP received: reloading dbmail.conf...");
     if ($self->{dbmail_postfix_policyd}{dbh}->{Active}) {
 	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
-	$self->{dbmail_postfix_policyd}{dbh} = undef;
     }
     # note this allows some settings to be changed via dbmail.conf
     # that were set via cli options, which could break things
@@ -863,6 +861,16 @@ Add option to customize returned message.
 
 =item -
 Scrap everything and re-write a policy server based on dbmail-lmtpd ?
+
+=back
+
+=head1 BUGS
+
+=over 4
+
+=item -
+Old versions (=< 0.87) of Net::Server are vulnerable to syslog format string
+vulnerabilities.  We could work around that, but currently don't.
 
 =back
 
