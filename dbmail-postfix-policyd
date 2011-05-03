@@ -93,14 +93,15 @@ sub db_reconnect($)
     } elsif ($d->{dbtype} =~ m/^sqlite$/i) {
       $dbd_type='SQLite';
     } else {
-      die "pre_loop_hook: unknown dbtype: this should not have happened!\n";
+      die "db_reconnect: unknown dbtype ($d->{dbtype})!\n";
     }
     $data_source="dbi:$dbd_type:dbname=$d->{dbdb}";
 
     # if database connection is open, close it
     if ($d->{dbh}->{Active}) {
-	$self->log(4, "db_reconnect: database is Active, disconnecting");
+	$self->log(4, "db_reconnect: Database is Active, disconnecting");
 	$d->{dbh}->disconnect();
+	$d->{dbh} = undef;
     }
 
     if (defined $d->{dbhost}) {
@@ -112,8 +113,9 @@ sub db_reconnect($)
 	$data_source .= ";host=$d->{dbsqlsocket}";
     }
 
+    $self->log(4, "db_reconnect: Connecting to $data_source as $d->{dbuser}");
     $d->{dbh} = DBI->connect($data_source, $d->{dbuser}, $d->{dbpass},
-      { RaiseError => 1, AutoCommit => 1 } ) || die "Error connecting to database: $DBI::errstr\n";
+      { RaiseError => 1, AutoCommit => 1 } ) || die "db_reconnect: Error connecting to database: $DBI::errstr\n";
 
     if ($dbd_type =~ m/mysql/) {
 	$self->log(4, "db_reconnect: Setting mysql_auto_reconnect");
@@ -184,7 +186,7 @@ sub dbmail_quota_check($$$)
     $quota_recurse_depth = 0;
 
     unless ($d->{dbh}->{Active}) {
-	$self->log(4, "dbmail_quota_check:  database NOT Active, reconnecting");
+	$self->log(4, "dbmail_quota_check:  Database NOT Active, reconnecting");
 	&db_reconnect($self);
     }
 
@@ -215,6 +217,8 @@ sub dbmail_v1_quota_check($$$)
     unless ($recipient = lc($recipient)) { return 0; }
     unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
 
+    $self->log(4, "dbmail_v1_quota_check: checking $recipient (recurse_depth $quota_recurse_depth)");
+
     # what's a sane max depth here?
     if ($quota_recurse_depth++ > 12) {
 	$self->log(2, "recipient $recipient hit max quota_recurse_depth - possible alias loop");
@@ -234,13 +238,18 @@ sub dbmail_v1_quota_check($$$)
 	$deliver_to = $row[0];
 
 	# commands start with ! or |
-	($deliver_to =~ /^(\!|\|)$/) && return 0;
+	if ($deliver_to =~ /^(\!|\|)$/) {
+	    $self->log(4, "dbmail_v1_quota_check: alias expands to command, accepting");
+	    return 0;
+	}
 
 	# all-numeric is a userid
 	if ($deliver_to =~ /^(\d+)$/) {
-	   push @user_idnrs, $deliver_to;
+	    $self->log(4, "dbmail_v1_quota_check: found user_idnr $deliver_to");
+	    push @user_idnrs, $deliver_to;
 	} else {
-	   push @recurse, $deliver_to;
+	    $self->log(4, "dbmail_v1_quota_check: found $deliver_to");
+	    push @recurse, $deliver_to;
 	}
     }
 
@@ -253,8 +262,12 @@ sub dbmail_v1_quota_check($$$)
     # we won't recurse past this point.
     $quota_recurse_depth--;
 
+    # TODO:  need to add user@ and @domain catchall lookups
+
     # didn't find a matching alias:  a showstopper for dbmail 1.x
     if ($numrows == 0) {
+	# should we add an "authoritive" mode, where we reject here?
+	$self->log(4, "dbmail_v1_quota_check: alias not found, accepting");
 	return 0;
     }
 
@@ -271,13 +284,23 @@ sub dbmail_v1_quota_check($$$)
 	}
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
-	    ($max == 0) && return 0;
-	    ($cur + $size <= $max) && return 0;
+	    if ($max == 0) {
+		$self->log(4, "dbmail_v1_quota_check: user_idnr $user_idnr has no quota, accepting");
+		return 0;
+	    }
+	    if ($cur + $size <= $max) {
+		$self->log(4, "dbmail_v1_quota_check: user_idnr $user_idnr still under quota, accepting");
+		return 0;
+	    }
 	}
-	($numrows) || return 0;
+	unless ($numrows) {
+	    # should we add an "authoritive" mode, where we reject here?
+	    $self->log(4, "dbmail_v1_quota_check: user_idnr $user_idnr not found, accepting");
+	    return 0;
+	}
     }
 
-    $self->log(4, "$recipient: $size bytes would exceed quota");
+    $self->log(4, "dbmail_v1_quota_check: $recipient: $size bytes would exceed quota");
     return 1;
 }
 
@@ -298,6 +321,8 @@ sub dbmail_v2_quota_check($$$)
     unless ($recipient = lc($recipient)) { return 0; }
     unless (($size =~ /^(\d+)$/) and ($size > 0)) { return 0; }
 
+    $self->log(4, "dbmail_v2_quota_check: checking $recipient (recurse_depth $quota_recurse_depth)");
+
     # what's a sane max depth here?
     if ($quota_recurse_depth++ > 12) {
 	$self->log(2, "recipient $recipient hit max quota_recurse_depth - possible alias loop");
@@ -317,13 +342,18 @@ sub dbmail_v2_quota_check($$$)
 	$deliver_to = $row[0];
 
 	# commands start with ! or |
-	($deliver_to =~ /^(\!|\|)$/) && return 0;
+	if ($deliver_to =~ /^(\!|\|)$/) {
+	    $self->log(4, "dbmail_v2_quota_check: alias expands to command, accepting");
+	    return 0;
+	}
 
 	# all-numeric is a userid
 	if ($deliver_to =~ /^(\d+)$/) {
-	   push @user_idnrs, $deliver_to;
+	    $self->log(4, "dbmail_v2_quota_check: found user_idnr $deliver_to");
+	    push @user_idnrs, $deliver_to;
 	} else {
-	   push @recurse, $deliver_to;
+	    $self->log(4, "dbmail_v2_quota_check: found $deliver_to");
+	    push @recurse, $deliver_to;
 	}
     }
 
@@ -340,6 +370,8 @@ sub dbmail_v2_quota_check($$$)
     # TODO:  need to add user@ and @domain catchall lookups
 
     if ($numrows == 0) {
+	$self->log(4, "dbmail_v2_quota_check: alias not found, checking for matching userid");
+
 	unless( $quota_by_userid_sth = $dbh->prepare_cached($quota_by_userid_stmt,{},1) ) {
 	    $self->log(2, "dbmail_v2_quota_check: prepare_cached(quota_by_userid_sth): $dbh->errstr");
 	    return 0;
@@ -350,11 +382,21 @@ sub dbmail_v2_quota_check($$$)
 	}
 
 	for ($numrows=0; ($max, $cur) = $quota_by_userid_sth->fetchrow_array; $numrows++ ) {
-	    ($max == 0) && return 0;
-	    ($cur + $size <= $max) && return 0;
+	    if ($max == 0) {
+		$self->log(4, "dbmail_v2_quota_check: userid $recipient has no quota, accepting");
+		return 0;
+	    }
+	    if ($cur + $size <= $max) {
+		$self->log(4, "dbmail_v2_quota_check: userid $recipient still under quota, accepting");
+		return 0;
+	    }
 	}
 	# dbmail 2. must have processed a row now, or will yet process @user_idnrs
-	($numrows && ($#user_idnrs >= 0)) || return 0;
+	if ($numrows && ($#user_idnrs >= 0)) {
+	    # should we add an "authoritive" mode, where we reject here?
+	    $self->log(4, "dbmail_v2_quota_check: userid not found, accepting");
+	    return 0;
+	}
     }
 
     # at this point, all user's ids are in @user_idnrs,
@@ -370,13 +412,23 @@ sub dbmail_v2_quota_check($$$)
 	}
 
 	for ($numrows=0; ($max, $cur) = $quota_sth->fetchrow_array; $numrows++ ){
-	    ($max == 0) && return 0;
-	    ($cur + $size <= $max) && return 0;
+	    if ($max == 0) {
+		$self->log(4, "dbmail_v2_quota_check: user_idnr $user_idnr has no quota, accepting");
+		return 0;
+	    }
+	    if ($cur + $size <= $max) {
+		$self->log(4, "dbmail_v2_quota_check: user_idnr $user_idnr still under quota, accepting");
+		return 0;
+	    }
 	}
-	($numrows) || return 0;
+	unless ($numrows) {
+	    # should we add an "authoritive" mode, where we reject here?
+	    $self->log(4, "dbmail_v2_quota_check: user_idnr $user_idnr not found, accepting");
+	    return 0;
+	}
     }
 
-    $self->log(4, "$recipient: $size bytes would exceed quota");
+    $self->log(4, "dbmail_v2_quota_check: $recipient: $size bytes would exceed quota");
     return 1;
 }
 
@@ -728,8 +780,8 @@ to the after-filter smtp server.
 =head1 SEE ALSO
 
 See L<https://github.com/jnorell/dbmail-postfix-policyd> for
-the latest version of dbmail-postfix-policyd and any other 
-project goodies.
+the latest version of dbmail-postfix-policyd, Installation
+help and any other project goodies.
 
 See L<http://www.dbmail.org/> for more information on
 dbmail.
@@ -746,9 +798,6 @@ fiters.
 
 =item -
 Need to add user@ and @domain catchall lookups.
-
-=item -
-Improve logging (content and destination).
 
 =item -
 Handle errors/restarts, maybe create a watcher script or 
