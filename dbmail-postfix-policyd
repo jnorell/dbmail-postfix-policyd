@@ -293,8 +293,6 @@ sub dbmail_v1_quota_check($$$)
     # we won't recurse past this point.
     $quota_recurse_depth--;
 
-    # TODO:  need to add user@ and @domain catchall lookups
-
     # didn't find a matching alias:  a showstopper for dbmail 1.x
     if ($numrows == 0) {
 	# should we add an "authoritive" mode, where we reject here?
@@ -397,13 +395,6 @@ sub dbmail_v2_quota_check($$$)
 	&dbmail_v2_quota_check($self, $recip, $size) || return 0;
     }
 
-    # at this point, dbmail 2.x may have all user_idnr's in @user_idnrs,
-    # or we may need to just do a userid lookup for the recipient.
-    # either way, we won't recurse past this point.
-    $quota_recurse_depth--;
-
-    # TODO:  need to add user@ and @domain catchall lookups
-
     if ($numrows == 0) {
 	$self->log(4, "dbmail_v2_quota_check: alias not found, checking for matching userid");
 
@@ -428,16 +419,60 @@ sub dbmail_v2_quota_check($$$)
 		return 0;
 	    }
 	}
-	# dbmail 2. must have processed a row now, or will yet process @user_idnrs
-	if ($numrows && ($#user_idnrs >= 0)) {
+
+	# dbmail 2 must have found a userid now, or will yet process @user_idnrs,
+	# else we try catchall addrs
+	unless (($numrows > 0) || ($#user_idnrs >= 0)) {
+	    my ($user, $dom) = split(/@/, $recipient);
+
+	    # if $user or $dom is empty, we're checking a catchall addr
+	    unless (length($user)>0 and length($dom)>0) {
+		$self->log(4, "dbmail_v2_quota_check: $recipient was a catchall lookup, accepting");
+		return 0;
+	    }
+
+	    $self->log(4, "dbmail_v2_quota_check: userid not found, begin checking for catchall addrs");
+
+	    my @catchalls = ("$user\@", "\@$dom");
+
+	    $_ = $dom;
+	    while (m/\./) {
+		$_ =~ s/^[^\.]*\.//;
+		push (@catchalls, '@.'.$_);
+	    }
+
+	    foreach my $addr (@catchalls) {
+		$self->log(4, "dbmail_v2_quota_check: checking for catchall $addr");
+
+		local $dbh->{RaiseError} = 0;
+		unless( $alias_sth->execute($addr) ) {
+		    $self->log(2, "dbmail_v2_quota_check: alias_sth: $alias_sth->errstr");
+		    return 0;
+		}
+		$dbh->{RaiseError} = 1;
+
+		for ($numrows=0; @row = $alias_sth->fetchrow_array; $numrows++ ) {
+		    $deliver_to = $row[0];
+
+		    if (length($deliver_to) > 0) {
+			$self->log(4, "dbmail_v2_quota_check: found catchall $addr");
+			# we check for catchalls in specific order, first match is determinative
+			return &dbmail_v2_quota_check($self, $addr, $size);
+		    }
+		}
+	    }
+
 	    # should we add an "authoritive" mode, where we reject here?
-	    $self->log(4, "dbmail_v2_quota_check: userid not found, accepting");
+	    $self->log(4, "dbmail_v2_quota_check: no catchall addrs found, accepting");
 	    return 0;
 	}
     }
 
     # at this point, all user's ids are in @user_idnrs,
-    # we can definitively check their quota
+    # we won't recurse past this point
+    $quota_recurse_depth--;
+
+    # and we can definitively check their quota
     foreach my $user_idnr (@user_idnrs) {
 	local $dbh->{RaiseError} = 0;
 	unless( $quota_sth = $dbh->prepare_cached($quota_stmt,{},1) ) {
@@ -836,9 +871,6 @@ fiters.
 =head1 TODO 
 
 =over 4
-
-=item -
-Need to add user@ and @domain catchall lookups.
 
 =item -
 Handle errors/restarts, maybe create a watcher script or 
