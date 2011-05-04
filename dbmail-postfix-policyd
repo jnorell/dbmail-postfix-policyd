@@ -17,6 +17,7 @@ use Getopt::Long 2.25 qw(:config posix_default no_ignore_case);
 use Net::Server::Multiplex;
 use Config::IniFiles;
 use Sys::Hostname;
+use Sys::Syslog;
 use DBI;
 
 use vars qw(@ISA);
@@ -703,8 +704,8 @@ sub pre_loop_hook()
 
     # be sure to put in syslog any warnings / fatal errors
     if($self->{server}{log_file} eq 'Sys::Syslog') {
-        $SIG{__WARN__} = sub { Sys::Syslog::syslog('warning', "warning: $_[0]") };
-        $SIG{__DIE__}  = sub { Sys::Syslog::syslog('crit', "fatal: $_[0]"); die @_; };
+        $SIG{__WARN__} = sub { Sys::Syslog::syslog('warning', '%s', "warning: $_[0]") };
+        $SIG{__DIE__}  = sub { Sys::Syslog::syslog('crit', '%s', "fatal: $_[0]"); die @_; };
     }
 
     &db_reconnect($self);
@@ -893,16 +894,6 @@ Add option to customize returned message.
 
 =item -
 Scrap everything and re-write a policy server based on dbmail-lmtpd ?
-
-=back
-
-=head1 BUGS
-
-=over 4
-
-=item -
-Old versions (=< 0.87) of Net::Server are vulnerable to syslog format string
-vulnerabilities.  We could work around that, but currently don't.
 
 =back
 
