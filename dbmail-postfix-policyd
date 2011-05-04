@@ -429,7 +429,7 @@ sub dbmail_v2_quota_check($$$)
 	    }
 	}
 	# dbmail 2. must have processed a row now, or will yet process @user_idnrs
-	if ($numrows && ($#user_idnrs >= 0)) {
+	unless (($numrows > 0) || ($#user_idnrs >= 0)) {
 	    # should we add an "authoritive" mode, where we reject here?
 	    $self->log(4, "dbmail_v2_quota_check: userid not found, accepting");
 	    return 0;
