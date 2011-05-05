@@ -112,14 +112,8 @@ sub db_reconnect($)
 
 	# finish active statement handlers
 	local $d->{dbh}->{RaiseError} = 0;
-	if ($alias_sth = $d->{dbh}->prepare_cached($d->{alias_stmt},{},1)) {
-	    if ($alias_sth->{Active}) { $alias_sth->finish(); }
-	}
-	if ($quota_sth = $d->{dbh}->prepare_cached($d->{quota_stmt},{},1)) {
-	    if ($quota_sth->{Active}) { $quota_sth->finish(); }
-	}
-	if ($quota_by_userid_sth = $d->{dbh}->prepare_cached($d->{quota_by_userid_stmt},{},1)) {
-	    if ($quota_by_userid_sth->{Active}) { $quota_by_userid_sth->finish(); }
+	for (grep { defined } @{$self->{dbmail_postfix_policyd}{dbh}->{ChildHandles}}) {
+	    $_->{Active} && $_->finish();
 	}
 	$d->{dbh}->{RaiseError} = 1;
 
@@ -679,6 +673,9 @@ sub sig_hup {
     my $self = shift;
     $self->log(2, "HUP received: reloading dbmail.conf...");
     if ($self->{dbmail_postfix_policyd}{dbh}->{Active}) {
+	for (grep { defined } @{$self->{dbmail_postfix_policyd}{dbh}->{ChildHandles}}) {
+	    $_->{Active} && $_->finish();
+	}
 	$self->{dbmail_postfix_policyd}{dbh}->disconnect();
     }
     # note this allows some settings to be changed via dbmail.conf
