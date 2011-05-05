@@ -1,0 +1,40 @@
+# Configuration for dbmail-postfix-policyd 
+
+# DBMail version (default: 2)
+#_DBMAIL_VERSION="1"
+
+# DBMail config file (default: /etc/dbmail/dbmail.conf)
+#_DBMAIL_CONF="/etc/dbmail.conf"
+
+# Verbose Logging (default: off)
+#_VERBOSE="-v"
+
+# Inet HOST:PORT or just PORT (default: localhost:60002)
+#_INET="127.0.0.1:60002"
+
+# Unix socket where Postfix talks to us (default: not used)
+#_UNIX="/var/spool/postfix/private/${NAME}"
+
+# PID file (default: /var/run/dbmail-postfix-policyd/dbmail-postfix-policyd.pid)
+#_PIDDIR="/var/run/${NAME}"
+#_PIDFILE="${PIDDIR}/${NAME}.pid"
+
+# run as USER and GROUP (default: dbmail:dbmail)
+#_USER="dbmail"
+#_GROUP="dbmail"
+
+# Database connection info (defaults: read from dbmail.conf)
+#_DBTYPE="mysql"	# DBMail 1.2 needs this set!! (or add to config file)
+#_DBHOST="localhost"
+#_SQLPORT="3306"
+#_SQLSOCKET=""
+#_DBUSER="dbmail"
+#_DBPASS="DontSetMeIfYouHaveMultipleUsers"
+#_DBDB="dbmail"
+
+# you can specify any options to dbmail-postfix-policyd here,
+# including any/all of the above settings (maybe don't set both)
+#_OPTS="--inet=60002 -f=/etc/dbmail.conf -V=1 --dbtype=mysql"
+
+# Note: the init script adds -d to daemonize
+

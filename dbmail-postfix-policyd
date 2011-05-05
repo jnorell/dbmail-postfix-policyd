@@ -80,7 +80,7 @@ sub read_dbmail_conf($$)
     }
     if (defined $ini{DBMAIL}{pass}) {
       $val = ini_cleanup($ini{DBMAIL}{pass});
-      $self->log(4, "read {DBMAIL}{pass}: $val");
+      $self->log(4, "read {DBMAIL}{pass}: (not displayed)");
       $self->{dbmail_postfix_policyd}{dbpass} = $val;
     }
     if (defined $ini{DBMAIL}{db}) {

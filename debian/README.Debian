@@ -1,0 +1,30 @@
+dbmail-postfix-policyd for Debian
+---------------------------------
+
+dbmail-postfix-policyd reads config values from dbmail.conf, often it will not
+be necessary to configure it explicitely.  It will not determine your dbmail
+version automatically, so be sure to set DBMAIL_VERSION in
+/etc/default/dbmail-postfix-policyd if you're not using the default version 2.
+
+  !! You must configure postfix to use dbmail-postfix-policyd !!
+
+There is no one-size-fits-all postfix configuration, you'll have to investigate
+and integrate.  You'll use something like this:
+
+        smtpd_recipient_restrictions =
+              ...
+              reject_unauth_destination
+              check_policy_service inet:127.0.0.1:60002
+
+        smtpd_end_of_data_restrictions =
+              check_policy_service inet:127.0.0.1:60002
+
+And if you use an after-queue content filter (eg. amavisd-new and other virus/
+spam scanners), add a "-o smtpd_end_of_data_restrictions =" to the after-filter
+smtp server (master.cf).  For more info see:
+
+	https://github.com/jnorell/dbmail-postfix-policyd/wiki/Installation
+
+---
+Jesse Norell <jesse@kci.net>
+
