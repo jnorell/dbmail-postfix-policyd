@@ -139,7 +139,11 @@ sub db_reconnect($)
 	    $data_source .= ";port=$d->{dbsqlport}";
 	}
     } elsif (defined $d->{dbsqlsocket}) {
-	$data_source .= ";host=$d->{dbsqlsocket}";
+	if ($dbd_type =~ m/mysql/) {
+	    $data_source .= ";mysql_socket=$d->{dbsqlsocket}";
+	} else {
+	    $data_source .= ";host=$d->{dbsqlsocket}";
+	}
     }
 
     $self->log(4, "db_reconnect: Connecting to $data_source as $d->{dbuser}");
