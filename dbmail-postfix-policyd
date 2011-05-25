@@ -133,16 +133,21 @@ sub db_reconnect($)
     }
     $data_source="dbi:$dbd_type:dbname=$d->{dbdb}";
 
-    if (defined $d->{dbhost}) {
+    if ($dbd_type =~ m/mysql/ && defined $d->{dbhost} && $d->{dbhost} =~ m/^localhost$/) {
 	$data_source .= ";host=$d->{dbhost}";
-	if (defined $d->{dbsqlport}) {
-	    $data_source .= ";port=$d->{dbsqlport}";
+	if (defined $d->{dbsqlsocket}) {
+	    $data_source .= ";mysql_socket=$d->{dbsqlsocket}";
 	}
     } elsif (defined $d->{dbsqlsocket}) {
 	if ($dbd_type =~ m/mysql/) {
 	    $data_source .= ";mysql_socket=$d->{dbsqlsocket}";
 	} else {
 	    $data_source .= ";host=$d->{dbsqlsocket}";
+	}
+    } elsif (defined $d->{dbhost}) {
+	$data_source .= ";host=$d->{dbhost}";
+	if (defined $d->{dbsqlport}) {
+	    $data_source .= ";port=$d->{dbsqlport}";
 	}
     }
 
